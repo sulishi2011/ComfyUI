@@ -26,6 +26,20 @@ import importlib
 import platform
 import weakref
 import gc
+import os
+import threading
+
+# ============ 多 GPU 调度相关配置 ============
+ENABLE_MULTI_GPU = os.getenv('COMFY_MULTI_GPU_SCHED', '0') == '1'
+
+if ENABLE_MULTI_GPU:
+    _current_loaded_models_by_device = {}  # device_id -> [LoadedModel]
+    _model_cache_lock = threading.RLock()
+    _use_device_cache = True
+    logging.info("✅ Multi-GPU scheduling ENABLED")
+else:
+    _use_device_cache = False
+    logging.info("ℹ️  Multi-GPU scheduling DISABLED (using default mode)")
 
 class VRAMState(Enum):
     DISABLED = 0    #No vram present: no need to move models to vram
@@ -448,6 +462,40 @@ except:
 
 current_loaded_models = []
 
+# 新增：统一缓存访问入口
+def _get_current_loaded_models(device=None):
+    """
+    统一缓存访问入口：根据开关自动返回正确的缓存
+
+    Args:
+        device: torch.device 对象，如果为 None 则使用当前设备
+
+    Returns:
+        list: 对应设备的 LoadedModel 列表
+    """
+    if _use_device_cache:
+        if device is None:
+            device = get_torch_device()
+
+        # 提取设备 ID
+        if hasattr(device, 'index') and device.index is not None:
+            device_id = device.index
+        elif hasattr(device, 'type') and device.type == 'cuda':
+            device_id = torch.cuda.current_device()
+        else:
+            device_id = 0  # CPU 或其他设备统一用 0
+
+        # 按设备分区
+        with _model_cache_lock:
+            if device_id not in _current_loaded_models_by_device:
+                _current_loaded_models_by_device[device_id] = []
+                logging.debug(f"Created model cache for device {device_id}")
+            return _current_loaded_models_by_device[device_id]
+    else:
+        # 兼容原有模式
+        global current_loaded_models
+        return current_loaded_models
+
 def module_size(module):
     module_mem = 0
     sd = module.state_dict()
@@ -583,8 +631,12 @@ def free_memory(memory_required, device, keep_loaded=[]):
     can_unload = []
     unloaded_models = []
 
-    for i in range(len(current_loaded_models) -1, -1, -1):
-        shift_model = current_loaded_models[i]
+    # ========== 新增：使用设备专属缓存 ==========
+    current_loaded = _get_current_loaded_models(device)
+    # =========================================
+
+    for i in range(len(current_loaded) -1, -1, -1):
+        shift_model = current_loaded[i]
         if shift_model.device == device:
             if shift_model not in keep_loaded and not shift_model.is_dead():
                 can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
@@ -598,12 +650,12 @@ def free_memory(memory_required, device, keep_loaded=[]):
             if free_mem > memory_required:
                 break
             memory_to_free = memory_required - free_mem
-        logging.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
-        if current_loaded_models[i].model_unload(memory_to_free):
+        logging.debug(f"Unloading {current_loaded[i].model.model.__class__.__name__}")
+        if current_loaded[i].model_unload(memory_to_free):
             unloaded_model.append(i)
 
     for i in sorted(unloaded_model, reverse=True):
-        unloaded_models.append(current_loaded_models.pop(i))
+        unloaded_models.append(current_loaded.pop(i))
 
     if len(unloaded_model) > 0:
         soft_empty_cache()
@@ -637,13 +689,19 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
 
     for x in models:
         loaded_model = LoadedModel(x)
+
+        # ========== 新增：获取设备专属缓存 ==========
+        device = loaded_model.device
+        current_loaded = _get_current_loaded_models(device)
+        # =========================================
+
         try:
-            loaded_model_index = current_loaded_models.index(loaded_model)
+            loaded_model_index = current_loaded.index(loaded_model)
         except:
             loaded_model_index = None
 
         if loaded_model_index is not None:
-            loaded = current_loaded_models[loaded_model_index]
+            loaded = current_loaded[loaded_model_index]
             loaded.currently_used = True
             models_to_load.append(loaded)
         else:
@@ -652,12 +710,17 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             models_to_load.append(loaded_model)
 
     for loaded_model in models_to_load:
+        # ========== 新增：获取设备专属缓存 ==========
+        device = loaded_model.device
+        current_loaded = _get_current_loaded_models(device)
+        # =========================================
+
         to_unload = []
-        for i in range(len(current_loaded_models)):
-            if loaded_model.model.is_clone(current_loaded_models[i].model):
+        for i in range(len(current_loaded)):
+            if loaded_model.model.is_clone(current_loaded[i].model):
                 to_unload = [i] + to_unload
         for i in to_unload:
-            model_to_unload = current_loaded_models.pop(i)
+            model_to_unload = current_loaded.pop(i)
             model_to_unload.model.detach(unpatch_all=False)
             model_to_unload.model_finalizer.detach()
 
@@ -695,7 +758,12 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             lowvram_model_memory = 0.1
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
-        current_loaded_models.insert(0, loaded_model)
+
+        # ========== 新增：使用设备专属缓存 ==========
+        device = loaded_model.device
+        current_loaded = _get_current_loaded_models(device)
+        current_loaded.insert(0, loaded_model)
+        # =========================================
     return
 
 def load_model_gpu(model):
@@ -1442,8 +1510,36 @@ def extended_fp16_support():
 
     return True
 
-def soft_empty_cache(force=False):
+def soft_empty_cache(force=False, device=None):
+    """
+    清空 CUDA 缓存
+
+    Args:
+        force: 强制清空缓存
+        device: 指定设备，如果为 None 则清空所有设备
+    """
     global cpu_state
+
+    # 新增：支持按设备清理
+    if device is not None and hasattr(device, 'type'):
+        if device.type == 'cuda':
+            device_id = device.index if hasattr(device, 'index') and device.index is not None else 0
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            logging.debug(f"Cleared cache for device cuda:{device_id}")
+            return
+        elif device.type == 'xpu':
+            torch.xpu.empty_cache()
+            return
+        elif device.type == 'npu':
+            torch.npu.empty_cache()
+            return
+        elif device.type == 'mlu':
+            torch.mlu.empty_cache()
+            return
+
+    # 原有逻辑：清空所有设备
     if cpu_state == CPUState.MPS:
         torch.mps.empty_cache()
     elif is_intel_xpu():

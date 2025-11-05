@@ -689,15 +689,76 @@ class PromptServer():
 
         @routes.get("/queue")
         async def get_queue(request):
+            # ========== 新增：支持多队列查询 ==========
+            # 解析目标 GPU ID
+            gpu_id_str = request.headers.get('X-TARGET-GPU', '0')
+            try:
+                gpu_id = int(gpu_id_str)
+                gpu_id = max(0, min(gpu_id, 3))  # 限制在 0-3
+            except ValueError:
+                gpu_id = 0
+
+            # 选择对应的队列
+            if hasattr(self, 'prompt_queues') and len(self.prompt_queues) > gpu_id:
+                target_queue = self.prompt_queues[gpu_id]
+            else:
+                target_queue = self.prompt_queue
+
             queue_info = {}
-            current_queue = self.prompt_queue.get_current_queue_volatile()
+            current_queue = target_queue.get_current_queue_volatile()
             remove_sensitive = lambda queue: [x[:5] for x in queue]
             queue_info['queue_running'] = remove_sensitive(current_queue[0])
             queue_info['queue_pending'] = remove_sensitive(current_queue[1])
+
+            # 如果是多 GPU 模式，返回当前查询的 GPU ID
+            if hasattr(self, 'prompt_queues'):
+                queue_info['gpu_id'] = gpu_id
+            # ==========================================
+
             return web.json_response(queue_info)
+
+        @routes.get("/queue/all")
+        async def get_all_queues(request):
+            """获取所有 GPU 队列的汇总状态"""
+            if not hasattr(self, 'prompt_queues'):
+                # 单 GPU 模式，重定向到普通 /queue
+                return await get_queue(request)
+
+            all_queues_info = []
+            remove_sensitive = lambda queue: [x[:5] for x in queue]
+
+            for gpu_id, queue in enumerate(self.prompt_queues):
+                current_queue = queue.get_current_queue_volatile()
+                queue_info = {
+                    'gpu_id': gpu_id,
+                    'queue_running': remove_sensitive(current_queue[0]),
+                    'queue_pending': remove_sensitive(current_queue[1]),
+                    'running_count': len(current_queue[0]),
+                    'pending_count': len(current_queue[1])
+                }
+                all_queues_info.append(queue_info)
+
+            total_running = sum(q['running_count'] for q in all_queues_info)
+            total_pending = sum(q['pending_count'] for q in all_queues_info)
+
+            return web.json_response({
+                'queues': all_queues_info,
+                'total_running': total_running,
+                'total_pending': total_pending
+            })
 
         @routes.post("/prompt")
         async def post_prompt(request):
+            # ========== 新增：GPU 路由 ==========
+            # 解析目标 GPU ID
+            gpu_id_str = request.headers.get('X-TARGET-GPU', '0')
+            try:
+                gpu_id = int(gpu_id_str)
+                gpu_id = max(0, min(gpu_id, 3))  # 限制在 0-3
+            except ValueError:
+                gpu_id = 0
+            # ==================================
+
             logging.info("got prompt")
             json_data =  await request.json()
             json_data = self.trigger_on_prompt(json_data)
@@ -733,8 +794,26 @@ class PromptServer():
                     for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:
                         if sensitive_val in extra_data:
                             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
-                    self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
+
+                    # ========== 修改：选择队列 ==========
+                    # 根据是否启用多 GPU 选择队列
+                    if hasattr(self, 'prompt_queues') and len(self.prompt_queues) > gpu_id:
+                        target_queue = self.prompt_queues[gpu_id]
+                        logging.debug(f"Routing prompt {prompt_id[:8]} to GPU {gpu_id}")
+                    else:
+                        # 向后兼容：单队列模式
+                        target_queue = self.prompt_queue
+                        gpu_id = 0
+
+                    target_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
+                    # ==================================
+
                     response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
+
+                    # 如果是多 GPU 模式，返回分配的 GPU ID
+                    if hasattr(self, 'prompt_queues'):
+                        response["gpu_id"] = gpu_id
+
                     return web.json_response(response)
                 else:
                     logging.warning("invalid prompt: {}".format(valid[1]))
@@ -750,15 +829,31 @@ class PromptServer():
 
         @routes.post("/queue")
         async def post_queue(request):
+            # ========== 新增：支持多队列操作 ==========
+            # 解析目标 GPU ID
+            gpu_id_str = request.headers.get('X-TARGET-GPU', '0')
+            try:
+                gpu_id = int(gpu_id_str)
+                gpu_id = max(0, min(gpu_id, 3))  # 限制在 0-3
+            except ValueError:
+                gpu_id = 0
+
+            # 选择对应的队列
+            if hasattr(self, 'prompt_queues') and len(self.prompt_queues) > gpu_id:
+                target_queue = self.prompt_queues[gpu_id]
+            else:
+                target_queue = self.prompt_queue
+            # ==========================================
+
             json_data =  await request.json()
             if "clear" in json_data:
                 if json_data["clear"]:
-                    self.prompt_queue.wipe_queue()
+                    target_queue.wipe_queue()
             if "delete" in json_data:
                 to_delete = json_data['delete']
                 for id_to_delete in to_delete:
                     delete_func = lambda a: a[1] == id_to_delete
-                    self.prompt_queue.delete_queue_item(delete_func)
+                    target_queue.delete_queue_item(delete_func)
 
             return web.Response(status=200)
 
@@ -772,16 +867,29 @@ class PromptServer():
             # Check if a specific prompt_id was provided for targeted interruption
             prompt_id = json_data.get('prompt_id')
             if prompt_id:
-                currently_running, _ = self.prompt_queue.get_current_queue()
-
-                # Check if the prompt_id matches any currently running prompt
+                # ========== 新增：支持多队列中断 ==========
                 should_interrupt = False
-                for item in currently_running:
-                    # item structure: (number, prompt_id, prompt, extra_data, outputs_to_execute)
-                    if item[1] == prompt_id:
-                        logging.info(f"Interrupting prompt {prompt_id}")
-                        should_interrupt = True
-                        break
+
+                if hasattr(self, 'prompt_queues'):
+                    # 多 GPU 模式：检查所有队列
+                    for gpu_id, queue in enumerate(self.prompt_queues):
+                        currently_running, _ = queue.get_current_queue()
+                        for item in currently_running:
+                            if item[1] == prompt_id:
+                                logging.info(f"Interrupting prompt {prompt_id} on GPU {gpu_id}")
+                                should_interrupt = True
+                                break
+                        if should_interrupt:
+                            break
+                else:
+                    # 单 GPU 模式
+                    currently_running, _ = self.prompt_queue.get_current_queue()
+                    for item in currently_running:
+                        if item[1] == prompt_id:
+                            logging.info(f"Interrupting prompt {prompt_id}")
+                            should_interrupt = True
+                            break
+                # ==========================================
 
                 if should_interrupt:
                     nodes.interrupt_processing()
