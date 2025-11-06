@@ -20,10 +20,11 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${BLUE}================================${NC}"
-echo -e "${BLUE}4 GPU 并发 Workflow 测试${NC}"
+echo -e "${BLUE}4 GPU 串行 Workflow 测试${NC}"
 echo -e "${BLUE}================================${NC}"
 echo ""
 echo -e "${YELLOW}注意：每个 GPU 将使用不同的随机 seed 生成不同的图片${NC}"
+echo -e "${YELLOW}每个 GPU 调用间隔 5 秒${NC}"
 echo ""
 
 # 读取 workflow JSON
@@ -98,6 +99,13 @@ EOF
     fi
 
     echo ""
+
+    # 每个 GPU 调用之间间隔 5 秒（最后一个不需要等待）
+    if [ $gpu_id -lt 3 ]; then
+        echo -e "${BLUE}等待 5 秒后提交下一个 GPU...${NC}"
+        sleep 5
+        echo ""
+    fi
 done
 
 echo -e "${BLUE}================================${NC}"
