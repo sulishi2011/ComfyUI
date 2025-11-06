@@ -111,13 +111,19 @@ def load_torch_file_cached(ckpt, safe_load=False, device=None, return_metadata=F
     """
     带缓存的模型加载 - 同一个文件只加载一次到 CPU RAM
     多个 GPU 共享同一份 state_dict，节省内存
+
+    注意：返回 state_dict 的浅拷贝，允许调用者修改字典结构，
+    但张量仍然是共享的（不占用额外内存）
     """
     # 检查缓存
     with _cache_lock:
         if ckpt in _state_dict_cache:
             logging.info(f"✅ 使用缓存的 state_dict: {ckpt}")
             cached_sd, cached_metadata = _state_dict_cache[ckpt]
-            return (cached_sd, cached_metadata) if return_metadata else cached_sd
+            # 返回浅拷贝：字典是新的，但张量仍然是引用
+            sd_copy = cached_sd.copy()
+            metadata_copy = cached_metadata.copy() if cached_metadata else None
+            return (sd_copy, metadata_copy) if return_metadata else sd_copy
 
     # 缓存未命中，从磁盘加载
     logging.info(f"📥 首次加载 state_dict 到 CPU RAM: {ckpt}")
@@ -127,7 +133,10 @@ def load_torch_file_cached(ckpt, safe_load=False, device=None, return_metadata=F
     with _cache_lock:
         _state_dict_cache[ckpt] = (sd, metadata)
 
-    return (sd, metadata) if return_metadata else sd
+    # 首次加载也返回副本，保持一致性
+    sd_copy = sd.copy()
+    metadata_copy = metadata.copy() if metadata else None
+    return (sd_copy, metadata_copy) if return_metadata else sd_copy
 
 
 def save_torch_file(sd, ckpt, metadata=None):
