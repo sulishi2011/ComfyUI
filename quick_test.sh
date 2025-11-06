@@ -7,6 +7,27 @@ set -e
 echo "================================"
 echo "ComfyUI 多 GPU 快速测试"
 echo "================================"
+
+# 认证 Token 设置
+# 优先从环境变量读取，否则提示输入
+if [ -z "$COMFY_AUTH_TOKEN" ]; then
+    echo ""
+    echo "请输入 ComfyUI 认证 Token（留空表示无需认证）："
+    read -r AUTH_TOKEN
+    echo ""
+else
+    AUTH_TOKEN="$COMFY_AUTH_TOKEN"
+    echo "🔐 Using authentication token from environment"
+fi
+
+# 设置认证头
+if [ -n "$AUTH_TOKEN" ]; then
+    AUTH_HEADER="Authorization: Bearer $AUTH_TOKEN"
+    echo "✓ Authentication enabled"
+else
+    AUTH_HEADER=""
+    echo "⚠ Running without authentication"
+fi
 echo ""
 
 # 颜色定义
@@ -84,17 +105,24 @@ echo ""
 echo "步骤 3: 检查 ComfyUI 运行状态"
 echo "--------------------------------"
 
-if curl -s http://localhost:8188 > /dev/null 2>&1; then
+# 构建 curl 命令
+if [ -n "$AUTH_HEADER" ]; then
+    CURL_CMD="curl -s -H \"$AUTH_HEADER\""
+else
+    CURL_CMD="curl -s"
+fi
+
+if eval $CURL_CMD http://localhost:8188 > /dev/null 2>&1; then
     check_pass "ComfyUI 正在运行 (端口 8188)"
 
     # 检查是否是多 GPU 模式
-    if curl -s http://localhost:8188/queue/all | grep -q "queues"; then
+    if eval $CURL_CMD http://localhost:8188/queue/all | grep -q "queues"; then
         check_pass "多 GPU 模式已启用"
 
         # 显示队列状态
         echo ""
         echo "当前队列状态："
-        curl -s http://localhost:8188/queue/all | python -m json.tool 2>/dev/null || echo "无法解析队列状态"
+        eval $CURL_CMD http://localhost:8188/queue/all | python -m json.tool 2>/dev/null || echo "无法解析队列状态"
     else
         check_warn "似乎运行在单 GPU 模式"
         echo "提示：使用 ./start_multi_gpu.sh 启动多 GPU 模式"
@@ -114,21 +142,21 @@ echo "步骤 4: 测试基本 API"
 echo "--------------------------------"
 
 # 测试 /queue 接口
-if curl -s http://localhost:8188/queue > /dev/null; then
+if eval $CURL_CMD http://localhost:8188/queue > /dev/null; then
     check_pass "/queue 接口正常"
 else
     check_fail "/queue 接口异常"
 fi
 
 # 测试 /queue/all 接口
-if curl -s http://localhost:8188/queue/all > /dev/null; then
+if eval $CURL_CMD http://localhost:8188/queue/all > /dev/null; then
     check_pass "/queue/all 接口正常"
 else
     check_fail "/queue/all 接口异常"
 fi
 
 # 测试 /history 接口
-if curl -s http://localhost:8188/history > /dev/null; then
+if eval $CURL_CMD http://localhost:8188/history > /dev/null; then
     check_pass "/history 接口正常"
 else
     check_fail "/history 接口异常"
@@ -142,7 +170,7 @@ echo "--------------------------------"
 
 NGINX_OK=false
 for port in 8181 8182 8183 8184; do
-    if curl -s http://localhost:$port > /dev/null 2>&1; then
+    if eval $CURL_CMD http://localhost:$port > /dev/null 2>&1; then
         check_pass "端口 $port 可访问"
         NGINX_OK=true
     else
@@ -187,7 +215,7 @@ echo "测试完成"
 echo "================================"
 echo ""
 
-if [ "$GPU_COUNT" -eq 4 ] && curl -s http://localhost:8188/queue/all | grep -q "queues"; then
+if [ "$GPU_COUNT" -eq 4 ] && eval $CURL_CMD http://localhost:8188/queue/all | grep -q "queues"; then
     check_pass "所有基础检查通过！"
     echo ""
     echo "建议下一步："
@@ -195,9 +223,18 @@ if [ "$GPU_COUNT" -eq 4 ] && curl -s http://localhost:8188/queue/all | grep -q "
     echo "  2. 运行并发测试验证性能"
     echo "  3. 查看详细测试指南: cat TEST_GUIDE_4GPU.md"
     echo ""
-    echo "快速测试命令："
-    echo "  # 查看队列状态"
-    echo "  curl http://localhost:8188/queue/all | jq"
+    if [ -n "$AUTH_HEADER" ]; then
+        echo "快速测试命令（含认证）："
+        echo "  # 设置环境变量"
+        echo "  export COMFY_AUTH_TOKEN='your-token-here'"
+        echo ""
+        echo "  # 查看队列状态"
+        echo "  curl -H 'Authorization: Bearer \$COMFY_AUTH_TOKEN' http://localhost:8188/queue/all | jq"
+    else
+        echo "快速测试命令："
+        echo "  # 查看队列状态"
+        echo "  curl http://localhost:8188/queue/all | jq"
+    fi
     echo ""
     echo "  # 监控 GPU"
     echo "  watch -n 1 nvidia-smi"

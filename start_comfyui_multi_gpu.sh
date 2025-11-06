@@ -132,23 +132,18 @@ start_nginx(){
 
 check_pytorch(){
   log_i "检查 PyTorch 环境..."
+  # 注意：不能在启动前导入 torch，否则会导致 CUDA 分配器配置冲突
+  # 只检查 PyTorch 是否安装，不初始化 CUDA
   python3 - <<'PY'
 import sys
 try:
-    import torch
-    v = torch.__version__
-    cuda_available = torch.cuda.is_available()
-    if cuda_available:
-        gpu_count = torch.cuda.device_count()
-        cuda_version = torch.version.cuda
-        print(f"✓ PyTorch: {v}")
-        print(f"✓ CUDA: {cuda_version}")
-        print(f"✓ GPU count: {gpu_count}")
-        for i in range(gpu_count):
-            print(f"✓ GPU[{i}]: {torch.cuda.get_device_name(i)}")
-    else:
-        print(f"✗ PyTorch {v} installed but CUDA not available!")
+    import importlib.util
+    torch_spec = importlib.util.find_spec("torch")
+    if torch_spec is None:
+        print("✗ PyTorch not installed!")
         sys.exit(1)
+    print("✓ PyTorch package found")
+    # 不导入 torch，避免提前初始化 CUDA
 except Exception as e:
     print(f"✗ PyTorch check failed: {e}")
     sys.exit(1)

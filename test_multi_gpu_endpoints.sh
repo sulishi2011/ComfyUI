@@ -4,6 +4,28 @@
 
 echo "🧪 Testing Multi-GPU Endpoints"
 echo "================================"
+
+# 认证 Token 设置
+# 优先从环境变量读取，否则提示输入
+if [ -z "$COMFY_AUTH_TOKEN" ]; then
+    echo ""
+    echo "请输入 ComfyUI 认证 Token（留空表示无需认证）："
+    read -r AUTH_TOKEN
+    echo ""
+else
+    AUTH_TOKEN="$COMFY_AUTH_TOKEN"
+    echo "🔐 Using authentication token from environment"
+    echo ""
+fi
+
+# 设置认证头
+if [ -n "$AUTH_TOKEN" ]; then
+    AUTH_HEADER="Authorization: Bearer $AUTH_TOKEN"
+    echo "✓ Authentication enabled"
+else
+    AUTH_HEADER=""
+    echo "⚠ Running without authentication"
+fi
 echo ""
 
 # 测试函数
@@ -16,7 +38,11 @@ test_endpoint() {
     echo "Testing GPU $gpu_id (port $port) - $method $endpoint"
 
     if [ "$method" == "GET" ]; then
-        response=$(curl -s -w "\n%{http_code}" "http://localhost:$port$endpoint")
+        if [ -n "$AUTH_HEADER" ]; then
+            response=$(curl -s -w "\n%{http_code}" -H "$AUTH_HEADER" "http://localhost:$port$endpoint")
+        else
+            response=$(curl -s -w "\n%{http_code}" "http://localhost:$port$endpoint")
+        fi
         status_code=$(echo "$response" | tail -n 1)
 
         if [ "$status_code" == "200" ]; then
@@ -26,7 +52,11 @@ test_endpoint() {
         fi
     elif [ "$method" == "POST" ]; then
         # 简单的 POST 测试（不发送实际数据）
-        response=$(curl -s -w "\n%{http_code}" -X POST "http://localhost:$port$endpoint" -H "Content-Type: application/json")
+        if [ -n "$AUTH_HEADER" ]; then
+            response=$(curl -s -w "\n%{http_code}" -X POST -H "$AUTH_HEADER" -H "Content-Type: application/json" "http://localhost:$port$endpoint")
+        else
+            response=$(curl -s -w "\n%{http_code}" -X POST -H "Content-Type: application/json" "http://localhost:$port$endpoint")
+        fi
         status_code=$(echo "$response" | tail -n 1)
 
         if [ "$status_code" == "200" ] || [ "$status_code" == "400" ]; then
@@ -40,7 +70,13 @@ test_endpoint() {
 
 # 检查 ComfyUI 是否运行
 echo "Checking if ComfyUI is running..."
-if ! curl -s http://localhost:8188 > /dev/null 2>&1; then
+if [ -n "$AUTH_HEADER" ]; then
+    CHECK_CMD="curl -s -H \"$AUTH_HEADER\" http://localhost:8188"
+else
+    CHECK_CMD="curl -s http://localhost:8188"
+fi
+
+if ! eval $CHECK_CMD > /dev/null 2>&1; then
     echo "❌ ComfyUI is not running on port 8188"
     echo "Please start ComfyUI first: ./start_multi_gpu.sh"
     exit 1
@@ -51,7 +87,13 @@ echo ""
 # 检查 Nginx 是否运行
 echo "Checking if Nginx is configured..."
 for port in 8181 8182 8183 8184; do
-    if ! curl -s http://localhost:$port > /dev/null 2>&1; then
+    if [ -n "$AUTH_HEADER" ]; then
+        CHECK_CMD="curl -s -H \"$AUTH_HEADER\" http://localhost:$port"
+    else
+        CHECK_CMD="curl -s http://localhost:$port"
+    fi
+
+    if ! eval $CHECK_CMD > /dev/null 2>&1; then
         echo "⚠️  Port $port is not accessible - Nginx may not be configured"
         echo "Please configure Nginx with the provided nginx.conf"
         exit 1
@@ -93,7 +135,12 @@ echo ""
 
 # 测试全局队列汇总
 echo "Testing /queue/all on main port (8188)"
-response=$(curl -s "http://localhost:8188/queue/all")
+if [ -n "$AUTH_HEADER" ]; then
+    response=$(curl -s -H "$AUTH_HEADER" "http://localhost:8188/queue/all")
+else
+    response=$(curl -s "http://localhost:8188/queue/all")
+fi
+
 if echo "$response" | grep -q "queues"; then
     echo "  ✅ /queue/all working"
     echo "  Response preview:"
@@ -113,13 +160,28 @@ echo "  - All standard APIs are accessible through each port"
 echo "  - Requests are automatically routed to the corresponding GPU"
 echo "  - Files (input/output) are shared across all ports"
 echo ""
-echo "Example usage:"
-echo "  # Upload to GPU 0"
-echo "  curl -X POST http://localhost:8181/upload/image -F 'image=@myimage.png'"
-echo ""
-echo "  # Send prompt to GPU 1"
-echo "  curl -X POST http://localhost:8182/prompt -H 'Content-Type: application/json' -d '{...}'"
-echo ""
-echo "  # Check GPU 2 queue"
-echo "  curl http://localhost:8183/queue"
+if [ -n "$AUTH_HEADER" ]; then
+    echo "Example usage (with authentication):"
+    echo "  # Set token in environment"
+    echo "  export COMFY_AUTH_TOKEN='your-token-here'"
+    echo ""
+    echo "  # Upload to GPU 0"
+    echo "  curl -X POST -H 'Authorization: Bearer \$COMFY_AUTH_TOKEN' http://localhost:8181/upload/image -F 'image=@myimage.png'"
+    echo ""
+    echo "  # Send prompt to GPU 1"
+    echo "  curl -X POST -H 'Authorization: Bearer \$COMFY_AUTH_TOKEN' -H 'Content-Type: application/json' http://localhost:8182/prompt -d '{...}'"
+    echo ""
+    echo "  # Check GPU 2 queue"
+    echo "  curl -H 'Authorization: Bearer \$COMFY_AUTH_TOKEN' http://localhost:8183/queue"
+else
+    echo "Example usage:"
+    echo "  # Upload to GPU 0"
+    echo "  curl -X POST http://localhost:8181/upload/image -F 'image=@myimage.png'"
+    echo ""
+    echo "  # Send prompt to GPU 1"
+    echo "  curl -X POST -H 'Content-Type: application/json' http://localhost:8182/prompt -d '{...}'"
+    echo ""
+    echo "  # Check GPU 2 queue"
+    echo "  curl http://localhost:8183/queue"
+fi
 echo ""
