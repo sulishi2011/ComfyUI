@@ -880,7 +880,7 @@ class StyleModel:
 
 
 def load_style_model(ckpt_path):
-    model_data = comfy.utils.load_torch_file_cached(ckpt_path, safe_load=True)
+    model_data = comfy.utils.load_torch_file(ckpt_path, safe_load=True)
     keys = model_data.keys()
     if "style_embedding" in keys:
         model = comfy.t2i_adapter.adapter.StyleAdapter(width=1024, context_dim=768, num_head=8, n_layes=3, num_token=8)
@@ -916,7 +916,7 @@ class CLIPType(Enum):
 def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}):
     clip_data = []
     for p in ckpt_paths:
-        clip_data.append(comfy.utils.load_torch_file_cached(p, safe_load=True))
+        clip_data.append(comfy.utils.load_torch_file(p, safe_load=True))
     return load_text_encoder_state_dicts(clip_data, embedding_directory=embedding_directory, clip_type=clip_type, model_options=model_options)
 
 
@@ -1152,7 +1152,7 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
     return clip
 
 def load_gligen(ckpt_path):
-    data = comfy.utils.load_torch_file_cached(ckpt_path, safe_load=True)
+    data = comfy.utils.load_torch_file(ckpt_path, safe_load=True)
     model = gligen.load_gligen(data)
     if model_management.should_use_fp16():
         model = model.half()
@@ -1189,7 +1189,7 @@ def load_checkpoint(config_path=None, ckpt_path=None, output_vae=True, output_cl
     return (model, clip, vae)
 
 def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}):
-    sd, metadata = comfy.utils.load_torch_file_cached(ckpt_path, safe_load=True, return_metadata=True)
+    sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
     out = load_state_dict_guess_config(sd, output_vae, output_clip, output_clipvision, embedding_directory, output_model, model_options, te_model_options=te_model_options, metadata=metadata)
     if out is None:
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(ckpt_path, model_detection_error_hint(ckpt_path, sd)))
@@ -1363,7 +1363,7 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None):
 
 
 def load_diffusion_model(unet_path, model_options={}):
-    sd, metadata = comfy.utils.load_torch_file_cached(unet_path, safe_load=True, return_metadata=True)
+    sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
     model = load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
