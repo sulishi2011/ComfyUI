@@ -23,6 +23,8 @@ echo -e "${BLUE}================================${NC}"
 echo -e "${BLUE}4 GPU 并发 Workflow 测试${NC}"
 echo -e "${BLUE}================================${NC}"
 echo ""
+echo -e "${YELLOW}注意：每个 GPU 将使用不同的随机 seed 生成不同的图片${NC}"
+echo ""
 
 # 读取 workflow JSON
 WORKFLOW_FILE="test-api.json"
@@ -41,23 +43,30 @@ CLIENT_ID="test-$(date +%s)"
 echo -e "${GREEN}正在向 4 个 GPU 端点提交 workflow...${NC}"
 echo ""
 
-# 存储 prompt_id
+# 存储 prompt_id 和 seed
 declare -a PROMPT_IDS
+declare -a SEEDS
 
 # 向 4 个端口并发提交
 for port in 8181 8182 8183 8184; do
     gpu_id=$((port - 8181))
 
+    # 生成随机 seed（使用时间戳 + GPU ID + 随机数）
+    RANDOM_SEED=$(( $(date +%s%N | cut -b1-13) + gpu_id * 1000 + RANDOM ))
+
+    # 替换 JSON 中的 seed 值
+    MODIFIED_WORKFLOW=$(echo "$WORKFLOW_JSON" | sed "s/\"seed\": [0-9]\\+/\"seed\": $RANDOM_SEED/g")
+
     # 构建请求体
     REQUEST_BODY=$(cat <<EOF
 {
-  "prompt": $WORKFLOW_JSON,
+  "prompt": $MODIFIED_WORKFLOW,
   "client_id": "${CLIENT_ID}_gpu${gpu_id}"
 }
 EOF
 )
 
-    echo -e "${YELLOW}>>> GPU $gpu_id (端口 $port)${NC}"
+    echo -e "${YELLOW}>>> GPU $gpu_id (端口 $port) - Seed: $RANDOM_SEED${NC}"
 
     # 发送请求
     if [ -n "$AUTH_TOKEN" ]; then
@@ -80,10 +89,12 @@ EOF
         echo -e "  ${GREEN}✅ 提交成功${NC}"
         echo -e "  Prompt ID: $prompt_id"
         PROMPT_IDS[$gpu_id]=$prompt_id
+        SEEDS[$gpu_id]=$RANDOM_SEED
     else
         echo -e "  ${RED}❌ 提交失败${NC}"
         echo -e "  响应: $response"
         PROMPT_IDS[$gpu_id]=""
+        SEEDS[$gpu_id]=""
     fi
 
     echo ""
@@ -99,7 +110,7 @@ echo "提交摘要："
 for i in {0..3}; do
     port=$((8181 + i))
     if [ -n "${PROMPT_IDS[$i]}" ]; then
-        echo -e "  GPU $i (端口 $port): ${GREEN}${PROMPT_IDS[$i]}${NC}"
+        echo -e "  GPU $i (端口 $port): ${GREEN}${PROMPT_IDS[$i]}${NC} [Seed: ${SEEDS[$i]}]"
     else
         echo -e "  GPU $i (端口 $port): ${RED}失败${NC}"
     fi
