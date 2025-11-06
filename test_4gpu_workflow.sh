@@ -28,7 +28,7 @@ echo -e "${YELLOW}每个 GPU 调用间隔 5 秒${NC}"
 echo ""
 
 # 读取 workflow JSON
-WORKFLOW_FILE="test-api.json"
+WORKFLOW_FILE="test-lora-api.json"
 
 if [ ! -f "$WORKFLOW_FILE" ]; then
     echo -e "${RED}错误: 找不到 $WORKFLOW_FILE${NC}"

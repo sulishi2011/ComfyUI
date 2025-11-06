@@ -529,16 +529,28 @@ class LoadedModel:
         return self._model()
 
     def model_memory(self):
-        return self.model.model_size()
+        m = self.model
+        if m is None:
+            return 0
+        return m.model_size()
 
     def model_loaded_memory(self):
-        return self.model.loaded_size()
+        m = self.model
+        if m is None:
+            return 0
+        return m.loaded_size()
 
     def model_offloaded_memory(self):
-        return self.model.model_size() - self.model.loaded_size()
+        m = self.model
+        if m is None:
+            return 0
+        return m.model_size() - m.loaded_size()
 
     def model_memory_required(self, device):
-        if device == self.model.current_loaded_device():
+        m = self.model
+        if m is None:
+            return 0
+        if device == m.current_loaded_device():
             return self.model_offloaded_memory()
         else:
             return self.model_memory()

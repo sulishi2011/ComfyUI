@@ -20,6 +20,7 @@
 import torch
 import math
 import struct
+import os
 import comfy.checkpoint_pickle
 import safetensors.torch
 import numpy as np
@@ -33,6 +34,15 @@ from comfy.cli_args import args
 
 MMAP_TORCH_FILES = args.mmap_torch_files
 DISABLE_MMAP = args.disable_mmap
+
+# 模型参数共享优化（使用 assign=True）
+# 警告：在 LoRA 场景下可能不稳定，默认禁用
+# 设置环境变量 COMFY_USE_ASSIGN_LOAD=1 来启用
+USE_ASSIGN_LOAD = os.getenv('COMFY_USE_ASSIGN_LOAD', '0') == '1'
+if USE_ASSIGN_LOAD:
+    logging.info("⚠️  模型参数共享优化已启用 (assign=True)，在 LoRA 场景下可能不稳定")
+else:
+    logging.info("ℹ️  模型参数共享优化已禁用（默认），使用标准加载模式")
 
 ALWAYS_SAFE_LOAD = False
 if hasattr(torch.serialization, "add_safe_globals"):  # TODO: this was added in pytorch 2.4, the unsafe path should be removed once earlier versions are deprecated
@@ -142,13 +152,22 @@ def load_torch_file_cached(ckpt, safe_load=False, device=None, return_metadata=F
 def load_state_dict_with_assign(model, state_dict, strict=False):
     """
     使用 assign=True 加载 state_dict 以避免复制张量，节省 CPU RAM
+
+    注意：assign=True 在 LoRA 场景下可能不稳定，默认禁用
+    要启用：设置环境变量 COMFY_USE_ASSIGN_LOAD=1
+
     支持 PyTorch 2.0+，对旧版本自动降级
     """
+    if not USE_ASSIGN_LOAD:
+        # 默认行为：复制张量（更安全，兼容 LoRA）
+        return model.load_state_dict(state_dict, strict=strict)
+
     try:
         # PyTorch 2.0+ 支持 assign=True，避免复制张量
         return model.load_state_dict(state_dict, strict=strict, assign=True)
     except TypeError:
-        # 旧版 PyTorch 不支持，回退到默认行为（会复制张量）
+        # 旧版 PyTorch 不支持，回退到默认行为
+        logging.warning("PyTorch version does not support assign=True, using default load_state_dict")
         return model.load_state_dict(state_dict, strict=strict)
 
 
