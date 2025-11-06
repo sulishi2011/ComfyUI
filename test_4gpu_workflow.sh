@@ -1,8 +1,20 @@
 #!/bin/bash
 
-# 测试脚本：向 4 个 GPU 端点并发提交相同的 workflow
+# 测试脚本：向 4 个 GPU 端点提交相同的 workflow
+# 支持串行模式（避免内存竞争）和并发模式（最快速度）
 
 set -e
+
+# 运行模式：serial（串行，默认）或 concurrent（并发）
+MODE="${1:-serial}"
+
+if [ "$MODE" != "serial" ] && [ "$MODE" != "concurrent" ]; then
+    echo "错误：无效的模式 '$MODE'"
+    echo "用法: $0 [serial|concurrent]"
+    echo "  serial     - 串行提交，间隔 5 秒（默认，避免内存竞争）"
+    echo "  concurrent - 并发提交，最快速度（可能导致内存峰值）"
+    exit 1
+fi
 
 # 认证 Token
 if [ -z "$COMFY_AUTH_TOKEN" ]; then
@@ -41,13 +53,39 @@ WORKFLOW_JSON=$(cat "$WORKFLOW_FILE")
 CLIENT_ID="test-$(date +%s)"
 
 echo -e "${GREEN}正在向 4 个 GPU 端点提交 workflow...${NC}"
+if [ "$MODE" = "serial" ]; then
+    echo -e "${YELLOW}模式：串行提交，每个请求间隔 5 秒（避免内存竞争）${NC}"
+    echo -e "${YELLOW}预计耗时：~15 秒（提交） + 生成时间${NC}"
+else
+    echo -e "${YELLOW}模式：并发提交（最快速度，可能导致内存峰值）${NC}"
+    echo -e "${YELLOW}预计耗时：~1 秒（提交） + 生成时间${NC}"
+fi
 echo ""
 
 # 存储 prompt_id 和 seed
 declare -a PROMPT_IDS
 declare -a SEEDS
 
-# 向 4 个端口并发提交
+# 清理内存函数
+clear_memory() {
+    local port=$1
+    echo -e "  ${BLUE}[清理] 触发内存释放...${NC}"
+
+    if [ -n "$AUTH_TOKEN" ]; then
+        curl -s -X POST \
+            -H "Authorization: Bearer $AUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"unload_models": true, "free_memory": true}' \
+            "http://localhost:$port/free" > /dev/null 2>&1
+    else
+        curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"unload_models": true, "free_memory": true}' \
+            "http://localhost:$port/free" > /dev/null 2>&1
+    fi
+}
+
+# 向 4 个端口串行提交（带间隔）
 for port in 8181 8182 8183 8184; do
     gpu_id=$((port - 8181))
 
@@ -66,7 +104,7 @@ for port in 8181 8182 8183 8184; do
 EOF
 )
 
-    echo -e "${YELLOW}>>> GPU $gpu_id (端口 $port) - Seed: $RANDOM_SEED${NC}"
+    echo -e "${YELLOW}>>> [$((gpu_id + 1))/4] GPU $gpu_id (端口 $port) - Seed: $RANDOM_SEED${NC}"
 
     # 发送请求
     if [ -n "$AUTH_TOKEN" ]; then
@@ -97,12 +135,33 @@ EOF
         SEEDS[$gpu_id]=""
     fi
 
+    # 如果是串行模式且不是最后一个请求，等待 5 秒
+    if [ "$MODE" = "serial" ] && [ $port -lt 8184 ]; then
+        echo -e "  ${YELLOW}⏱  等待 5 秒...${NC}"
+        sleep 5
+
+        # 可选：触发内存清理（如果 ComfyUI 支持 /free 端点）
+        # clear_memory 8188
+    fi
+
     echo ""
 done
 
 echo -e "${BLUE}================================${NC}"
-echo -e "${GREEN}所有任务已提交！${NC}"
+echo -e "${GREEN}✅ 所有任务已提交！${NC}"
 echo -e "${BLUE}================================${NC}"
+echo ""
+echo -e "${GREEN}提交统计：${NC}"
+submitted_count=0
+for i in {0..3}; do
+    if [ -n "${PROMPT_IDS[$i]}" ]; then
+        submitted_count=$((submitted_count + 1))
+    fi
+done
+echo -e "  成功: ${GREEN}$submitted_count${NC} / 4"
+if [ $submitted_count -lt 4 ]; then
+    echo -e "  失败: ${RED}$((4 - submitted_count))${NC} / 4"
+fi
 echo ""
 
 # 显示摘要
