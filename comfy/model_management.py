@@ -801,18 +801,6 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
                 # 当前设备没有，需要加载
                 if hasattr(x, "model"):
                     logging.info(f"Requested to load {x.model.__class__.__name__}")
-
-                # 多 GPU 模式：检查是否可以从共享池复用底层模型
-                if _use_shared_cache and model_hash and model_hash in _shared_model_pool:
-                    # 找到共享的底层模型！
-                    shared_base_model = _shared_model_pool[model_hash]
-                    # 让当前 ModelPatcher 的底层模型指向共享的模型
-                    if hasattr(x, 'model') and x.model is not shared_base_model:
-                        x.model = shared_base_model
-                        logging.info(f"♻️  [RAM Shared] Reusing base model from shared pool: {x.__class__.__name__} (hash: {model_hash})")
-                    # 重新创建 LoadedModel（因为底层模型已替换）
-                    temp_loaded = LoadedModel(x)
-
                 models_to_load.append(temp_loaded)
     finally:
         if _use_shared_cache:
