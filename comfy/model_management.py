@@ -36,6 +36,7 @@ if ENABLE_MULTI_GPU:
     # 使用全局共享缓存，所有 GPU 共享同一份 CPU 内存中的模型
     _shared_model_cache = []  # 全局共享的模型缓存（CPU 侧）
     _model_cache_lock = threading.RLock()
+    _shared_model_pool = {}  # key: model_hash, value: 原始 model 对象（仅 CPU 内存）
     _use_shared_cache = True
     logging.info("✅ Multi-GPU scheduling ENABLED (with shared CPU cache)")
 else:
@@ -503,6 +504,27 @@ class LoadedModel:
         self.model_finalizer = None
         self._patcher_finalizer = None
 
+        # 多 GPU 模式：计算模型标识用于缓存查找
+        if _use_shared_cache:
+            self.model_hash = self._compute_model_hash(model)
+        else:
+            self.model_hash = None
+
+    def _compute_model_hash(self, model):
+        """计算模型的唯一标识"""
+        try:
+            # 使用模型大小、类型和类名组合作为标识
+            size = model.model_size()
+            type_name = model.__class__.__name__
+            # 如果有 model 属性，也包含它的类型
+            if hasattr(model, 'model') and model.model is not None:
+                inner_type = model.model.__class__.__name__
+                return f"{type_name}_{inner_type}_{size}"
+            return f"{type_name}_{size}"
+        except:
+            # 降级方案：使用类名
+            return model.__class__.__name__
+
     def _set_model(self, model):
         self._model = weakref.ref(model)
         if model.parent is not None:
@@ -690,37 +712,51 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
 
     models_to_load = []
 
-    # ========== 多 GPU 模式：加锁避免并发加载 ==========
+    # ========== 多 GPU 模式：使用模型池避免重复加载到 RAM ==========
     if _use_shared_cache:
         _model_cache_lock.acquire()
+
     try:
         for x in models:
-            loaded_model = LoadedModel(x)
+            # 先计算模型标识
+            temp_loaded = LoadedModel(x)
+            model_hash = temp_loaded.model_hash if _use_shared_cache else None
 
-            # 获取共享缓存
-            device = loaded_model.device
+            # 检查是否已在缓存中
+            device = temp_loaded.device
             current_loaded = _get_current_loaded_models(device)
 
-            try:
-                loaded_model_index = current_loaded.index(loaded_model)
-            except:
-                loaded_model_index = None
+            found_in_cache = None
+            if _use_shared_cache and model_hash:
+                # 基于 model_hash 查找
+                for cached in current_loaded:
+                    if hasattr(cached, 'model_hash') and cached.model_hash == model_hash:
+                        found_in_cache = cached
+                        break
 
-            if loaded_model_index is not None:
-                # 找到了！复用已加载的模型
-                loaded = current_loaded[loaded_model_index]
-                loaded.currently_used = True
-                models_to_load.append(loaded)
+            if found_in_cache is None:
+                # 兼容旧的比较方式
+                try:
+                    loaded_model_index = current_loaded.index(temp_loaded)
+                    found_in_cache = current_loaded[loaded_model_index]
+                except:
+                    pass
+
+            if found_in_cache is not None:
+                # 找到了！复用，不需要重新加载
+                found_in_cache.currently_used = True
+                models_to_load.append(found_in_cache)
                 if _use_shared_cache:
-                    logging.info(f"♻️  [Shared Cache] Reusing loaded model: {x.model.__class__.__name__}")
+                    logging.info(f"♻️  [RAM Shared] Reusing cached model: {x.__class__.__name__} (hash: {model_hash})")
             else:
+                # 没找到，需要加载
                 if hasattr(x, "model"):
                     logging.info(f"Requested to load {x.model.__class__.__name__}")
-                models_to_load.append(loaded_model)
+                models_to_load.append(temp_loaded)
     finally:
         if _use_shared_cache:
             _model_cache_lock.release()
-    # ==================================================
+    # ==================================================================
 
     for loaded_model in models_to_load:
         # ========== 新增：获取设备专属缓存 ==========
@@ -752,7 +788,28 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
                 models_l = free_memory(minimum_memory_required, device)
                 logging.info("{} models unloaded.".format(len(models_l)))
 
+    # 分离新加载和复用的模型
+    models_to_really_load = []
+    models_reused = []
+
+    current_loaded_all = _get_current_loaded_models()
     for loaded_model in models_to_load:
+        # 检查这个模型是否已经在缓存中（真正已加载的）
+        is_already_loaded = False
+        if _use_shared_cache and hasattr(loaded_model, 'model_hash') and loaded_model.model_hash:
+            # 基于 hash 判断
+            for cached in current_loaded_all:
+                if hasattr(cached, 'model_hash') and cached.model_hash == loaded_model.model_hash:
+                    is_already_loaded = True
+                    break
+
+        if is_already_loaded:
+            models_reused.append(loaded_model)
+        else:
+            models_to_really_load.append(loaded_model)
+
+    # 只对新模型执行完整加载（RAM 加载）
+    for loaded_model in models_to_really_load:
         model = loaded_model.model
         torch_dev = model.load_device
         if is_device_cpu(torch_dev):
@@ -770,26 +827,21 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
         if vram_set_state == VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
 
+        # 真正加载到 RAM
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
 
-        # ========== 多 GPU 模式：将模型tensor设置为共享内存 ==========
-        if _use_shared_cache:
-            try:
-                model = loaded_model.model
-                if hasattr(model, 'model') and model.model is not None:
-                    # 将模型权重设置为共享内存
-                    for name, param in model.model.named_parameters():
-                        if not param.is_shared():
-                            param.data = param.data.share_memory_()
-                    logging.info(f"🔗 [Shared Memory] Model tensors set to shared memory: {model.__class__.__name__}")
-            except Exception as e:
-                logging.warning(f"⚠️  Failed to share model memory: {e}")
-        # =================================================================
-
-        # 使用共享缓存
+        # 添加到共享缓存
         device = loaded_model.device
         current_loaded = _get_current_loaded_models(device)
         current_loaded.insert(0, loaded_model)
+
+        if _use_shared_cache and hasattr(loaded_model, 'model_hash'):
+            logging.info(f"💾 [RAM] Loaded model to cache: {loaded_model.model.__class__.__name__} (hash: {loaded_model.model_hash})")
+
+    # 复用的模型：已经在 RAM 中，只需要传输到对应的 GPU VRAM
+    if _use_shared_cache and models_reused:
+        logging.info(f"✓ [RAM Saved] Skipped reloading {len(models_reused)} model(s) - using shared RAM cache")
+
     return
 
 def load_model_gpu(model):
