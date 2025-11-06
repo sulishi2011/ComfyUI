@@ -139,6 +139,19 @@ def load_torch_file_cached(ckpt, safe_load=False, device=None, return_metadata=F
     return (sd_copy, metadata_copy) if return_metadata else sd_copy
 
 
+def load_state_dict_with_assign(model, state_dict, strict=False):
+    """
+    使用 assign=True 加载 state_dict 以避免复制张量，节省 CPU RAM
+    支持 PyTorch 2.0+，对旧版本自动降级
+    """
+    try:
+        # PyTorch 2.0+ 支持 assign=True，避免复制张量
+        return model.load_state_dict(state_dict, strict=strict, assign=True)
+    except TypeError:
+        # 旧版 PyTorch 不支持，回退到默认行为（会复制张量）
+        return model.load_state_dict(state_dict, strict=strict)
+
+
 def save_torch_file(sd, ckpt, metadata=None):
     if metadata is not None:
         safetensors.torch.save_file(sd, ckpt, metadata=metadata)

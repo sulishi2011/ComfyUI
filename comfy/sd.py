@@ -256,7 +256,7 @@ class CLIP:
 
     def load_sd(self, sd, full_model=False):
         if full_model:
-            return self.cond_stage_model.load_state_dict(sd, strict=False)
+            return comfy.utils.load_state_dict_with_assign(self.cond_stage_model, sd, strict=False)
         else:
             return self.cond_stage_model.load_sd(sd)
 
@@ -580,7 +580,7 @@ class VAE:
             self.first_stage_model = AutoencoderKL(**(config['params']))
         self.first_stage_model = self.first_stage_model.eval()
 
-        m, u = self.first_stage_model.load_state_dict(sd, strict=False)
+        m, u = comfy.utils.load_state_dict_with_assign(self.first_stage_model, sd, strict=False)
         if len(m) > 0:
             logging.warning("Missing VAE keys {}".format(m))
 
