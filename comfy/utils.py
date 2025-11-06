@@ -26,6 +26,7 @@ import numpy as np
 from PIL import Image
 import logging
 import itertools
+import threading
 from torch.nn.functional import interpolate
 from einops import rearrange
 from comfy.cli_args import args
@@ -53,6 +54,12 @@ if hasattr(torch.serialization, "add_safe_globals"):  # TODO: this was added in 
     logging.info("Checkpoint files will always be loaded safely.")
 else:
     logging.info("Warning, you are using an old pytorch version and some ckpt/pt files might be loaded unsafely. Upgrading to 2.4 or above is recommended.")
+
+
+# ============ 极简模型缓存 ============
+# CPU RAM 中只保留一份模型，多个 GPU 共享
+_state_dict_cache = {}  # {ckpt_path: (state_dict, metadata)}
+_cache_lock = threading.Lock()
 
 def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     if device is None:
@@ -98,6 +105,30 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
             else:
                 sd = pl_sd
     return (sd, metadata) if return_metadata else sd
+
+
+def load_torch_file_cached(ckpt, safe_load=False, device=None, return_metadata=False):
+    """
+    带缓存的模型加载 - 同一个文件只加载一次到 CPU RAM
+    多个 GPU 共享同一份 state_dict，节省内存
+    """
+    # 检查缓存
+    with _cache_lock:
+        if ckpt in _state_dict_cache:
+            logging.info(f"✅ 使用缓存的 state_dict: {ckpt}")
+            cached_sd, cached_metadata = _state_dict_cache[ckpt]
+            return (cached_sd, cached_metadata) if return_metadata else cached_sd
+
+    # 缓存未命中，从磁盘加载
+    logging.info(f"📥 首次加载 state_dict 到 CPU RAM: {ckpt}")
+    sd, metadata = load_torch_file(ckpt, safe_load=safe_load, device=device, return_metadata=True)
+
+    # 保存到缓存
+    with _cache_lock:
+        _state_dict_cache[ckpt] = (sd, metadata)
+
+    return (sd, metadata) if return_metadata else sd
+
 
 def save_torch_file(sd, ckpt, metadata=None):
     if metadata is not None:
