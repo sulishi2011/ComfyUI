@@ -573,7 +573,20 @@ class LoadedModel:
         return self.model.partially_load(self.device, extra_memory, force_patch_weights=force_patch_weights)
 
     def __eq__(self, other):
-        return self.model is other.model
+        # 多 GPU 模式：基于模型大小和类型判断（而不是对象引用）
+        if _use_shared_cache:
+            if self.model is other.model:
+                return True
+            # 如果是相同大小和类型的模型，认为是同一个
+            try:
+                return (self.model.model_size() == other.model.model_size() and
+                        type(self.model) == type(other.model) and
+                        self.model.__class__.__name__ == other.model.__class__.__name__)
+            except:
+                return False
+        else:
+            # 单 GPU 模式：保持原有逻辑
+            return self.model is other.model
 
     def __del__(self):
         if self._patcher_finalizer is not None:
@@ -677,27 +690,37 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
 
     models_to_load = []
 
-    for x in models:
-        loaded_model = LoadedModel(x)
+    # ========== 多 GPU 模式：加锁避免并发加载 ==========
+    if _use_shared_cache:
+        _model_cache_lock.acquire()
+    try:
+        for x in models:
+            loaded_model = LoadedModel(x)
 
-        # ========== 新增：获取设备专属缓存 ==========
-        device = loaded_model.device
-        current_loaded = _get_current_loaded_models(device)
-        # =========================================
+            # 获取共享缓存
+            device = loaded_model.device
+            current_loaded = _get_current_loaded_models(device)
 
-        try:
-            loaded_model_index = current_loaded.index(loaded_model)
-        except:
-            loaded_model_index = None
+            try:
+                loaded_model_index = current_loaded.index(loaded_model)
+            except:
+                loaded_model_index = None
 
-        if loaded_model_index is not None:
-            loaded = current_loaded[loaded_model_index]
-            loaded.currently_used = True
-            models_to_load.append(loaded)
-        else:
-            if hasattr(x, "model"):
-                logging.info(f"Requested to load {x.model.__class__.__name__}")
-            models_to_load.append(loaded_model)
+            if loaded_model_index is not None:
+                # 找到了！复用已加载的模型
+                loaded = current_loaded[loaded_model_index]
+                loaded.currently_used = True
+                models_to_load.append(loaded)
+                if _use_shared_cache:
+                    logging.info(f"♻️  [Shared Cache] Reusing loaded model: {x.model.__class__.__name__}")
+            else:
+                if hasattr(x, "model"):
+                    logging.info(f"Requested to load {x.model.__class__.__name__}")
+                models_to_load.append(loaded_model)
+    finally:
+        if _use_shared_cache:
+            _model_cache_lock.release()
+    # ==================================================
 
     for loaded_model in models_to_load:
         # ========== 新增：获取设备专属缓存 ==========
@@ -749,11 +772,24 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
 
-        # ========== 新增：使用设备专属缓存 ==========
+        # ========== 多 GPU 模式：将模型tensor设置为共享内存 ==========
+        if _use_shared_cache:
+            try:
+                model = loaded_model.model
+                if hasattr(model, 'model') and model.model is not None:
+                    # 将模型权重设置为共享内存
+                    for name, param in model.model.named_parameters():
+                        if not param.is_shared():
+                            param.data = param.data.share_memory_()
+                    logging.info(f"🔗 [Shared Memory] Model tensors set to shared memory: {model.__class__.__name__}")
+            except Exception as e:
+                logging.warning(f"⚠️  Failed to share model memory: {e}")
+        # =================================================================
+
+        # 使用共享缓存
         device = loaded_model.device
         current_loaded = _get_current_loaded_models(device)
         current_loaded.insert(0, loaded_model)
-        # =========================================
     return
 
 def load_model_gpu(model):
