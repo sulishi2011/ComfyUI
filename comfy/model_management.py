@@ -55,17 +55,27 @@ def _extract_model_storage(model, model_hash):
         if hasattr(model, 'model') and model.model is not None:
             base_model = model.model
             shared_count = 0
+            total_params = 0
 
             # 直接操作 named_parameters，将 CPU 参数设置为共享内存
             for name, param in base_model.named_parameters():
-                if param.device.type == 'cpu' and not param.is_shared():
-                    param.data.share_memory_()
-                    shared_count += 1
+                total_params += 1
+                # 记录参数状态用于调试
+                if param.device.type == 'cpu':
+                    if not param.is_shared():
+                        param.data.share_memory_()
+                        shared_count += 1
+                else:
+                    # 参数不在 CPU 上，记录警告
+                    if shared_count == 0 and total_params == 1:  # 只在第一个参数时警告一次
+                        logging.warning(f"⚠️  Model parameters already on {param.device}, cannot set share_memory_() for {model.__class__.__name__}")
 
             if shared_count > 0:
                 # 标记此模型已共享
                 _shared_storage_pool[model_hash] = base_model
-                logging.info(f"💾 [Shared Memory] Set {shared_count} CPU tensors to shared memory for {model.__class__.__name__} (hash: {model_hash})")
+                logging.info(f"💾 [Shared Memory] Set {shared_count}/{total_params} CPU tensors to shared memory for {model.__class__.__name__} (hash: {model_hash})")
+            else:
+                logging.warning(f"⚠️  Failed to set shared memory: 0/{total_params} parameters were on CPU for {model.__class__.__name__}")
     except Exception as e:
         logging.warning(f"⚠️  Failed to extract storage for {model.__class__.__name__}: {e}")
 
