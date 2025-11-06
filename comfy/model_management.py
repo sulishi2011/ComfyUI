@@ -33,12 +33,13 @@ import threading
 ENABLE_MULTI_GPU = os.getenv('COMFY_MULTI_GPU_SCHED', '0') == '1'
 
 if ENABLE_MULTI_GPU:
-    _current_loaded_models_by_device = {}  # device_id -> [LoadedModel]
+    # 使用全局共享缓存，所有 GPU 共享同一份 CPU 内存中的模型
+    _shared_model_cache = []  # 全局共享的模型缓存（CPU 侧）
     _model_cache_lock = threading.RLock()
-    _use_device_cache = True
-    logging.info("✅ Multi-GPU scheduling ENABLED")
+    _use_shared_cache = True
+    logging.info("✅ Multi-GPU scheduling ENABLED (with shared CPU cache)")
 else:
-    _use_device_cache = False
+    _use_shared_cache = False
     logging.info("ℹ️  Multi-GPU scheduling DISABLED (using default mode)")
 
 class VRAMState(Enum):
@@ -465,34 +466,23 @@ current_loaded_models = []
 # 新增：统一缓存访问入口
 def _get_current_loaded_models(device=None):
     """
-    统一缓存访问入口：根据开关自动返回正确的缓存
+    统一缓存访问入口：返回全局共享的模型缓存
+
+    在多 GPU 模式下，所有 GPU 共享同一份 CPU 内存中的模型缓存，
+    减少内存占用（从 4 份降低到 1 份）
 
     Args:
-        device: torch.device 对象，如果为 None 则使用当前设备
+        device: torch.device 对象（多 GPU 模式下被忽略，使用共享缓存）
 
     Returns:
-        list: 对应设备的 LoadedModel 列表
+        list: 共享的 LoadedModel 列表
     """
-    if _use_device_cache:
-        if device is None:
-            device = get_torch_device()
-
-        # 提取设备 ID
-        if hasattr(device, 'index') and device.index is not None:
-            device_id = device.index
-        elif hasattr(device, 'type') and device.type == 'cuda':
-            device_id = torch.cuda.current_device()
-        else:
-            device_id = 0  # CPU 或其他设备统一用 0
-
-        # 按设备分区
-        with _model_cache_lock:
-            if device_id not in _current_loaded_models_by_device:
-                _current_loaded_models_by_device[device_id] = []
-                logging.debug(f"Created model cache for device {device_id}")
-            return _current_loaded_models_by_device[device_id]
+    if _use_shared_cache:
+        # 多 GPU 模式：返回全局共享缓存
+        global _shared_model_cache
+        return _shared_model_cache
     else:
-        # 兼容原有模式
+        # 单 GPU 模式：兼容原有逻辑
         global current_loaded_models
         return current_loaded_models
 
