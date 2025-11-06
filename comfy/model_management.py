@@ -776,6 +776,18 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
         current_loaded = _get_current_loaded_models(device)
         current_loaded.insert(0, loaded_model)
         # =========================================
+
+    # ========== COW 统计信息 ==========
+    try:
+        import comfy.utils
+        cow_stats = comfy.utils.get_cow_stats()
+        if cow_stats['clones'] > 0:
+            logging.info(f"📊 COW 统计: 克隆 {cow_stats['clones']} 个参数, "
+                        f"占用 {cow_stats['bytes_cloned'] / 1024**3:.2f} GB")
+    except Exception:
+        pass
+    # ===================================
+
     return
 
 def load_model_gpu(model):

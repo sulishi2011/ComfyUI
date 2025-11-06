@@ -21,6 +21,7 @@ import torch
 import math
 import struct
 import os
+import weakref
 import comfy.checkpoint_pickle
 import safetensors.torch
 import numpy as np
@@ -39,8 +40,16 @@ DISABLE_MMAP = args.disable_mmap
 # 警告：在 LoRA 场景下可能不稳定，默认禁用
 # 设置环境变量 COMFY_USE_ASSIGN_LOAD=1 来启用
 USE_ASSIGN_LOAD = os.getenv('COMFY_USE_ASSIGN_LOAD', '0') == '1'
+
+# ============ COW (Copy-On-Write) 支持 ============
+# 写时复制机制，配合 assign=True 使用，兼容 LoRA
+# 当检测到要修改共享参数时，自动创建私有副本
+_shared_param_storages = weakref.WeakValueDictionary()  # storage_ptr -> original_tensor
+_shared_param_enabled = False
+_cow_stats = {'clones': 0, 'bytes_cloned': 0}  # 统计信息
+
 if USE_ASSIGN_LOAD:
-    logging.info("⚠️  模型参数共享优化已启用 (assign=True)，在 LoRA 场景下可能不稳定")
+    logging.info("⚠️  模型参数共享优化已启用 (assign=True) + COW 保护")
 else:
     logging.info("ℹ️  模型参数共享优化已禁用（默认），使用标准加载模式")
 
@@ -149,13 +158,68 @@ def load_torch_file_cached(ckpt, safe_load=False, device=None, return_metadata=F
     return (sd_copy, metadata_copy) if return_metadata else sd_copy
 
 
+# ============ COW 辅助函数 ============
+
+def mark_params_as_shared(state_dict):
+    """
+    标记 state_dict 中的所有张量为共享
+    在使用 assign=True 加载后调用
+    """
+    global _shared_param_enabled
+    _shared_param_enabled = True
+
+    marked_count = 0
+    for key, tensor in state_dict.items():
+        if isinstance(tensor, torch.Tensor):
+            storage_ptr = tensor.storage().data_ptr()
+            _shared_param_storages[storage_ptr] = tensor
+            marked_count += 1
+
+    logging.info(f"✅ COW: 标记 {marked_count} 个参数为共享（写时复制已启用）")
+
+
+def is_shared_param(tensor):
+    """
+    检测张量是否来自共享的 state_dict
+    """
+    if not _shared_param_enabled:
+        return False
+
+    if not isinstance(tensor, torch.Tensor):
+        return False
+
+    try:
+        storage_ptr = tensor.storage().data_ptr()
+        return storage_ptr in _shared_param_storages
+    except Exception:
+        # 某些特殊张量可能没有 storage（如空张量）
+        return False
+
+
+def get_cow_stats():
+    """
+    获取 COW 统计信息
+    """
+    return _cow_stats.copy()
+
+
+def reset_cow_stats():
+    """
+    重置 COW 统计信息
+    """
+    global _cow_stats
+    _cow_stats = {'clones': 0, 'bytes_cloned': 0}
+
+
 def load_state_dict_with_assign(model, state_dict, strict=False):
     """
     使用 assign=True 加载 state_dict 以避免复制张量，节省 CPU RAM
 
-    注意：assign=True 在 LoRA 场景下可能不稳定，默认禁用
-    要启用：设置环境变量 COMFY_USE_ASSIGN_LOAD=1
+    配合 COW (Copy-On-Write) 机制，自动兼容 LoRA：
+    - 加载时参数共享（节省内存）
+    - 修改时自动创建私有副本（兼容性）
 
+    要启用：设置环境变量 COMFY_USE_ASSIGN_LOAD=1
     支持 PyTorch 2.0+，对旧版本自动降级
     """
     if not USE_ASSIGN_LOAD:
@@ -164,7 +228,12 @@ def load_state_dict_with_assign(model, state_dict, strict=False):
 
     try:
         # PyTorch 2.0+ 支持 assign=True，避免复制张量
-        return model.load_state_dict(state_dict, strict=strict, assign=True)
+        result = model.load_state_dict(state_dict, strict=strict, assign=True)
+
+        # ✅ 启用 COW 保护：标记共享参数
+        mark_params_as_shared(state_dict)
+
+        return result
     except TypeError:
         # 旧版 PyTorch 不支持，回退到默认行为
         logging.warning("PyTorch version does not support assign=True, using default load_state_dict")
@@ -826,6 +895,69 @@ def copy_to_param(obj, attr, value):
         obj = getattr(obj, name)
     prev = getattr(obj, attrs[-1])
     prev.data.copy_(value)
+
+
+# ============ COW 版本的写回函数 ============
+
+def set_attr_param_with_cow(obj, attr, value):
+    """
+    写时复制版本的 set_attr_param
+    如果目标参数是共享的，先克隆再替换
+
+    这样可以安全地在共享底模上应用 LoRA 等修改
+    """
+    # 获取当前参数
+    try:
+        current = get_attr(obj, attr)
+    except AttributeError:
+        # 参数不存在，直接设置
+        return set_attr(obj, attr, torch.nn.Parameter(value, requires_grad=False))
+
+    # 检测是否共享
+    if is_shared_param(current):
+        # 统计
+        global _cow_stats
+        _cow_stats['clones'] += 1
+        _cow_stats['bytes_cloned'] += current.numel() * current.element_size()
+
+        logging.debug(f"🔄 COW: 参数 {attr} 是共享的，创建私有副本 ({current.numel() * current.element_size() / 1024**2:.2f} MB)")
+
+        # 写时复制：先克隆当前参数
+        cloned = torch.nn.Parameter(current.detach().clone(), requires_grad=False)
+        set_attr(obj, attr, cloned)
+
+    # 正常替换（现在操作的是私有副本或非共享参数）
+    return set_attr(obj, attr, torch.nn.Parameter(value, requires_grad=False))
+
+
+def copy_to_param_with_cow(obj, attr, value):
+    """
+    写时复制版本的 copy_to_param
+    如果目标参数是共享的，先克隆再写入
+    """
+    attrs = attr.split(".")
+    for name in attrs[:-1]:
+        obj = getattr(obj, name)
+
+    prev = getattr(obj, attrs[-1])
+
+    # 检测是否共享
+    if is_shared_param(prev):
+        # 统计
+        global _cow_stats
+        _cow_stats['clones'] += 1
+        _cow_stats['bytes_cloned'] += prev.numel() * prev.element_size()
+
+        logging.debug(f"🔄 COW: 参数 {attr} 是共享的，创建私有副本 ({prev.numel() * prev.element_size() / 1024**2:.2f} MB)")
+
+        # 写时复制：克隆参数
+        cloned = torch.nn.Parameter(prev.detach().clone(), requires_grad=False)
+        setattr(obj, attrs[-1], cloned)
+        prev = cloned
+
+    # 原地更新（现在操作的是私有副本或非共享参数）
+    prev.data.copy_(value)
+
 
 def get_attr(obj, attr: str):
     """Retrieves a nested attribute from an object using dot notation.

@@ -630,9 +630,11 @@ class ModelPatcher:
         if set_func is None:
             out_weight = comfy.float.stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key))
             if inplace_update:
-                comfy.utils.copy_to_param(self.model, key, out_weight)
+                # 使用 COW 版本，兼容共享参数
+                comfy.utils.copy_to_param_with_cow(self.model, key, out_weight)
             else:
-                comfy.utils.set_attr_param(self.model, key, out_weight)
+                # 使用 COW 版本，兼容共享参数
+                comfy.utils.set_attr_param_with_cow(self.model, key, out_weight)
         else:
             set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
 
