@@ -613,6 +613,12 @@ class LoadedModel:
         self.model.model_patches_to(self.device)
         self.model.model_patches_to(self.model.model_dtype())
 
+        # 多 GPU 模式：在传输到 GPU 之前，设置 share_memory_()
+        if _use_shared_cache and hasattr(self, 'model_hash') and self.model_hash:
+            if self.model_hash not in _shared_storage_pool:
+                # 首次加载，将 CPU 参数设为共享内存
+                _extract_model_storage(self.model, self.model_hash)
+
         # if self.model.loaded_size() > 0:
         use_more_vram = lowvram_model_memory
         if use_more_vram == 0:
@@ -877,9 +883,8 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
                 else:
                     # 首次加载此模型
                     logging.info(f"💾 [First Load] Loading model to RAM: {model.__class__.__name__}")
+                    # model_load() 内部会调用 _extract_model_storage()
                     loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
-                    # 加载完成，设置共享内存并加入池
-                    _extract_model_storage(model, model_hash)
         else:
             # 非多 GPU 模式，正常加载
             loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
