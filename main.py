@@ -110,7 +110,6 @@ import shutil
 import threading
 import gc
 from collections import deque
-import torch
 
 # ============ 多 GPU 调度配置 ============
 ENABLE_MULTI_GPU = os.getenv('COMFY_MULTI_GPU_SCHED', '0') == '1'
@@ -154,6 +153,9 @@ if __name__ == "__main__":
 
 if 'torch' in sys.modules:
     logging.warning("WARNING: Potential Error in code: Torch already imported, torch should never be imported before this point.")
+
+# Import torch AFTER cuda_malloc to ensure proper CUDA allocator configuration
+import torch
 
 import comfy.utils
 
