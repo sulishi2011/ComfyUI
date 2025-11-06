@@ -20,6 +20,10 @@ export MKL_NUM_THREADS=4
 # 可选：启用 CUDA 优化
 export CUDA_LAUNCH_BLOCKING=0
 
+# 可选：启用模型参数共享优化（节省内存，但 LoRA 场景可能不稳定）
+# 多 GPU 场景建议启用，可减少 RAM 占用
+export COMFY_USE_ASSIGN_LOAD=1
+
 # 添加其他环境变量（根据需要取消注释）
 # export COMFYUI_S3_BUCKET_NAME="your-bucket"
 # export COMFYUI_AWS_ACCESS_KEY_ID="your-key"
