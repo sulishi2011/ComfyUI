@@ -876,10 +876,9 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
                 if model_hash in _shared_storage_pool:
                     # 已加载！复用共享的底层模型
                     if _apply_shared_storage(model, model_hash):
-                        logging.info(f"♻️  [RAM Reused] Skipped loading from disk, using shared model in RAM: {model.__class__.__name__}")
-                    else:
-                        # 复用失败，正常加载
-                        loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+                        logging.info(f"♻️  [RAM Reused] Using shared model in RAM: {model.__class__.__name__}")
+                    # 无论复用是否成功，都需要调用 model_load() 完成 GPU 传输和初始化
+                    loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
                 else:
                     # 首次加载此模型
                     logging.info(f"💾 [First Load] Loading model to RAM: {model.__class__.__name__}")
