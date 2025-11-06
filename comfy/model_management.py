@@ -47,50 +47,45 @@ else:
     logging.info("ℹ️  Multi-GPU scheduling DISABLED (using default mode)")
 
 def _extract_model_storage(model, model_hash):
-    """提取模型的所有参数到共享池（使用 share_memory_）"""
+    """提取模型的 state_dict 到共享池（使用 share_memory_）"""
     if not _use_shared_cache or model_hash in _shared_storage_pool:
         return
 
     try:
         if hasattr(model, 'model') and model.model is not None:
             base_model = model.model
-            shared_count = 0
-            total_params = 0
 
-            # 直接操作 named_parameters，将 CPU 参数设置为共享内存
-            for name, param in base_model.named_parameters():
-                total_params += 1
-                # 记录参数状态用于调试
-                if param.device.type == 'cpu':
+            # 获取 state_dict 并设置共享内存
+            state_dict = base_model.state_dict()
+            shared_count = 0
+
+            for key, param in state_dict.items():
+                if isinstance(param, torch.Tensor) and param.device.type == 'cpu':
                     if not param.is_shared():
-                        param.data.share_memory_()
+                        param.share_memory_()
                         shared_count += 1
-                else:
-                    # 参数不在 CPU 上，记录警告
-                    if shared_count == 0 and total_params == 1:  # 只在第一个参数时警告一次
-                        logging.warning(f"⚠️  Model parameters already on {param.device}, cannot set share_memory_() for {model.__class__.__name__}")
 
             if shared_count > 0:
-                # 标记此模型已共享
-                _shared_storage_pool[model_hash] = base_model
-                logging.info(f"💾 [Shared Memory] Set {shared_count}/{total_params} CPU tensors to shared memory for {model.__class__.__name__} (hash: {model_hash})")
+                # 保存共享的 state_dict
+                _shared_storage_pool[model_hash] = state_dict
+                logging.info(f"💾 [Shared Memory] Cached state_dict with {shared_count} shared tensors for {model.__class__.__name__} (hash: {model_hash})")
             else:
-                logging.warning(f"⚠️  Failed to set shared memory: 0/{total_params} parameters were on CPU for {model.__class__.__name__}")
+                logging.warning(f"⚠️  No CPU tensors found to share for {model.__class__.__name__}")
     except Exception as e:
         logging.warning(f"⚠️  Failed to extract storage for {model.__class__.__name__}: {e}")
 
 def _apply_shared_storage(model, model_hash):
-    """从共享池复用已有的模型对象，避免重新加载"""
+    """从共享池加载 state_dict 到当前模型，避免重新从磁盘读取"""
     if not _use_shared_cache or model_hash not in _shared_storage_pool:
         return False
 
     try:
-        shared_base_model = _shared_storage_pool[model_hash]
+        shared_state_dict = _shared_storage_pool[model_hash]
 
-        # 让当前 ModelPatcher 直接使用共享的底层模型
-        if hasattr(model, 'model') and model.model is not shared_base_model:
-            model.model = shared_base_model
-            logging.info(f"♻️  [Shared Memory] Reusing shared base model for {model.__class__.__name__} (hash: {model_hash})")
+        # 使用共享的 state_dict 加载参数（避免从磁盘读取）
+        if hasattr(model, 'model') and model.model is not None:
+            model.model.load_state_dict(shared_state_dict, strict=False)
+            logging.info(f"♻️  [Shared Memory] Loaded model from shared state_dict for {model.__class__.__name__} (hash: {model_hash})")
             return True
     except Exception as e:
         logging.warning(f"⚠️  Failed to apply shared storage for {model.__class__.__name__}: {e}")
