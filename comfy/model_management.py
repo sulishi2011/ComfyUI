@@ -36,8 +36,10 @@ if ENABLE_MULTI_GPU:
     # 使用全局共享缓存，所有 GPU 共享同一份 CPU 内存中的模型
     _shared_model_cache = []  # 全局共享的模型缓存（CPU 侧）
     _model_cache_lock = threading.RLock()
-    # 存储共享的模型参数 storage，key: model_hash, value: {param_key: (storage, shape, dtype)}
+    # 存储共享的模型基础对象，key: model_hash, value: base_model (已设置 share_memory_)
     _shared_storage_pool = {}
+    # 加载锁：确保同一个模型只有一个 Worker 在加载
+    _model_loading_locks = {}  # key: model_hash, value: threading.Lock
     _use_shared_cache = True
     logging.info("✅ Multi-GPU scheduling ENABLED (with shared CPU cache)")
 else:
@@ -45,58 +47,41 @@ else:
     logging.info("ℹ️  Multi-GPU scheduling DISABLED (using default mode)")
 
 def _extract_model_storage(model, model_hash):
-    """提取模型的所有参数 storage 到共享池"""
+    """提取模型的所有参数到共享池（使用 share_memory_）"""
     if not _use_shared_cache or model_hash in _shared_storage_pool:
         return
 
-    storage_dict = {}
     try:
         if hasattr(model, 'model') and model.model is not None:
             base_model = model.model
-            if hasattr(base_model, 'state_dict'):
-                state = base_model.state_dict()
-                for key, param in state.items():
-                    if isinstance(param, torch.Tensor):
-                        # 存储 storage 引用、形状和数据类型
-                        storage_dict[key] = (param.untyped_storage(), param.shape, param.dtype, param.device)
+            shared_count = 0
 
-                _shared_storage_pool[model_hash] = storage_dict
-                logging.info(f"💾 [Storage Pool] Cached {len(storage_dict)} parameter storages for {model.__class__.__name__} (hash: {model_hash})")
+            # 直接操作 named_parameters，将 CPU 参数设置为共享内存
+            for name, param in base_model.named_parameters():
+                if param.device.type == 'cpu' and not param.is_shared():
+                    param.data.share_memory_()
+                    shared_count += 1
+
+            if shared_count > 0:
+                # 标记此模型已共享
+                _shared_storage_pool[model_hash] = base_model
+                logging.info(f"💾 [Shared Memory] Set {shared_count} CPU tensors to shared memory for {model.__class__.__name__} (hash: {model_hash})")
     except Exception as e:
         logging.warning(f"⚠️  Failed to extract storage for {model.__class__.__name__}: {e}")
 
 def _apply_shared_storage(model, model_hash):
-    """从共享池应用 storage 到模型参数，避免重新分配内存"""
+    """从共享池复用已有的模型对象，避免重新加载"""
     if not _use_shared_cache or model_hash not in _shared_storage_pool:
         return False
 
     try:
-        if hasattr(model, 'model') and model.model is not None:
-            base_model = model.model
-            storage_dict = _shared_storage_pool[model_hash]
+        shared_base_model = _shared_storage_pool[model_hash]
 
-            if hasattr(base_model, 'state_dict'):
-                state = base_model.state_dict()
-                replaced_count = 0
-
-                for key, param in state.items():
-                    if key in storage_dict and isinstance(param, torch.Tensor):
-                        shared_storage, shared_shape, shared_dtype, shared_device = storage_dict[key]
-
-                        # 确保参数在 CPU 上且形状匹配
-                        if param.shape == shared_shape and param.dtype == shared_dtype:
-                            # 创建一个新的 tensor，使用共享的 storage
-                            new_param = torch.tensor([], dtype=shared_dtype, device=shared_device)
-                            new_param.set_(shared_storage, 0, shared_shape)
-
-                            # 替换参数
-                            if hasattr(param, 'copy_'):
-                                param.data = new_param
-                                replaced_count += 1
-
-                if replaced_count > 0:
-                    logging.info(f"♻️  [Storage Shared] Reused {replaced_count} parameter storages from shared pool for {model.__class__.__name__} (hash: {model_hash})")
-                    return True
+        # 让当前 ModelPatcher 直接使用共享的底层模型
+        if hasattr(model, 'model') and model.model is not shared_base_model:
+            model.model = shared_base_model
+            logging.info(f"♻️  [Shared Memory] Reusing shared base model for {model.__class__.__name__} (hash: {model_hash})")
+            return True
     except Exception as e:
         logging.warning(f"⚠️  Failed to apply shared storage for {model.__class__.__name__}: {e}")
 
@@ -860,22 +845,34 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
         if vram_set_state == VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
 
-        # 多 GPU 模式：检查是否已有共享的 storage
-        has_shared_storage = False
+        # 多 GPU 模式：使用锁保证串行加载同一模型
         if _use_shared_cache and hasattr(loaded_model, 'model_hash') and loaded_model.model_hash:
-            has_shared_storage = loaded_model.model_hash in _shared_storage_pool
+            model_hash = loaded_model.model_hash
 
-        # 加载模型到 GPU
-        loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+            # 获取或创建此模型的加载锁
+            if model_hash not in _model_loading_locks:
+                _model_loading_locks[model_hash] = threading.Lock()
 
-        # 多 GPU 模式：处理 storage 共享
-        if _use_shared_cache and hasattr(loaded_model, 'model_hash') and loaded_model.model_hash:
-            if has_shared_storage:
-                # 尝试从共享池应用 storage（在加载后立即替换）
-                _apply_shared_storage(model, loaded_model.model_hash)
-            else:
-                # 首次加载，提取 storage 到共享池
-                _extract_model_storage(model, loaded_model.model_hash)
+            loading_lock = _model_loading_locks[model_hash]
+
+            with loading_lock:
+                # 持有锁，检查是否已经有其他 Worker 加载了
+                if model_hash in _shared_storage_pool:
+                    # 已加载！复用共享的底层模型
+                    if _apply_shared_storage(model, model_hash):
+                        logging.info(f"♻️  [RAM Reused] Skipped loading from disk, using shared model in RAM: {model.__class__.__name__}")
+                    else:
+                        # 复用失败，正常加载
+                        loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+                else:
+                    # 首次加载此模型
+                    logging.info(f"💾 [First Load] Loading model to RAM: {model.__class__.__name__}")
+                    loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+                    # 加载完成，设置共享内存并加入池
+                    _extract_model_storage(model, model_hash)
+        else:
+            # 非多 GPU 模式，正常加载
+            loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
 
         # 添加到设备缓存
         device = loaded_model.device
